@@ -2,12 +2,23 @@ import csv
 import random
 import os
 import sys
+import re
+import threading
+import tempfile
+import subprocess
+import asyncio
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QMessageBox, QSpinBox
+    QLabel, QPushButton, QMessageBox, QSpinBox, QCheckBox
 )
-from PyQt6.QtCore import QTimer, Qt, QEvent
+from PyQt6.QtCore import QTimer, Qt, QEvent, pyqtSignal
 from PyQt6.QtGui import QFont
+
+try:
+    import edge_tts
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
 
 
 def resource_path(filename):
@@ -41,6 +52,8 @@ def save_words(words_list, file_path='words_tmp.csv'):
 
 
 class VocabTrainer(QWidget):
+    tts_finished = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("单词背诵训练器")
@@ -59,8 +72,14 @@ class VocabTrainer(QWidget):
         self.countdown = self.default_countdown
         self.current_word = ""
         self.current_meaning = ""
+        self.tts_enabled = False
+        self.tts_process = None
+        self._tts_stop = threading.Event()
+        self.auto_keep_timer = None
+        self._waiting_for_tts = False
 
         self.init_ui()
+        self.tts_finished.connect(self._on_tts_finished)
         QApplication.instance().installEventFilter(self)
         self.timer = QTimer()
         self.timer.timeout.connect(self.tick)
@@ -125,6 +144,14 @@ class VocabTrainer(QWidget):
         self.countdown_spin.valueChanged.connect(self.on_countdown_changed)
         timer_layout.addWidget(self.countdown_spin)
         timer_layout.addStretch()
+        self.tts_checkbox = QCheckBox("\U0001f50a 文字转语音")
+        self.tts_checkbox.setFont(QFont("Arial", 12))
+        self.tts_checkbox.setChecked(False)
+        self.tts_checkbox.setEnabled(TTS_AVAILABLE)
+        if not TTS_AVAILABLE:
+            self.tts_checkbox.setToolTip("需要安装 edge-tts: pip install edge-tts")
+        self.tts_checkbox.toggled.connect(self._on_tts_toggled)
+        timer_layout.addWidget(self.tts_checkbox)
         layout.addLayout(timer_layout)
 
         # 剩余单词数
@@ -178,11 +205,80 @@ class VocabTrainer(QWidget):
     def on_countdown_changed(self, value):
         self.default_countdown = value
 
+    def _on_tts_toggled(self, checked):
+        self.tts_enabled = checked
+        if not checked:
+            self._stop_tts()
+
+    def _stop_tts(self):
+        """停止当前TTS播放"""
+        self._tts_stop.set()
+        if self.tts_process and self.tts_process.poll() is None:
+            self.tts_process.terminate()
+
+    _POS_ABBREVS = [
+        (r'\badj\.', '形容词'),
+        (r'\badv\.', '副词'),
+        (r'\bconj\.', '连词'),
+        (r'\bprep\.', '介词'),
+        (r'\bpron\.', '代词'),
+        (r'\bnum\.', '数词'),
+        (r'\bart\.', '冠词'),
+        (r'\bint\.', '感叹词'),
+        (r'\bvt\.', '及物动词'),
+        (r'\bvi\.', '不及物动词'),
+        (r'\bv\.', '动词'),
+        (r'\bn\.', '名词'),
+    ]
+
+    def _expand_pos(self, text):
+        """将词性缩写展开为中文"""
+        for pattern, replacement in self._POS_ABBREVS:
+            text = re.sub(pattern, replacement, text)
+        return text
+
+    def _speak(self, text):
+        """后台生成并播放TTS"""
+        if not self.tts_enabled or not TTS_AVAILABLE:
+            return
+        self._stop_tts()
+        self._tts_stop = threading.Event()
+        stop_event = self._tts_stop
+
+        def _run():
+            try:
+                tts_text = self._expand_pos(text)
+                if re.search(r'[\u4e00-\u9fff]', tts_text):
+                    voice = "zh-CN-XiaoxiaoNeural"
+                else:
+                    voice = "en-US-AriaNeural"
+                with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
+                    tmp_path = f.name
+                asyncio.run(edge_tts.Communicate(tts_text, voice).save(tmp_path))
+                if stop_event.is_set():
+                    os.unlink(tmp_path)
+                    return
+                self.tts_process = subprocess.Popen(['afplay', tmp_path])
+                self.tts_process.wait()
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                if not stop_event.is_set():
+                    self.tts_finished.emit()
+            except Exception as e:
+                print(f"TTS error: {e}")
+                if not stop_event.is_set():
+                    self.tts_finished.emit()
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def next_word(self):
         """抽取下一个单词并开始倒计时"""
         self.current_word, self.current_meaning = random.choice(self.words_list)
         self.word_label.setText(self.current_word)
         self.meaning_label.setText("")
+        self._speak(self.current_word)
         self.countdown = self.default_countdown
         self.status_label.setText(f"倒计时: {self.countdown} 秒...")
         self.progress_label.setText(f"剩余: {len(self.words_list)} / {self.total_words}")
@@ -198,12 +294,36 @@ class VocabTrainer(QWidget):
             self.timer.stop()
             self.meaning_label.setText(self.current_meaning)
             self.set_buttons_enabled(True)
-            self.status_label.setText("请选择：保留 / 记住了 / 保存退出")
+            if self.tts_enabled:
+                self._waiting_for_tts = True
+                self._speak(self.current_meaning)
+                self.status_label.setText("请选择：保留 / 记住了 / 保存退出 (语音播完后自动保留)")
+            else:
+                self.status_label.setText("请选择：保留 / 记住了 / 保存退出 (3秒后自动保留)")
+                self.auto_keep_timer = QTimer.singleShot(3000, self._auto_keep)
+
+    def _on_tts_finished(self):
+        """TTS播放完成回调"""
+        if self._waiting_for_tts and self.btn_keep.isEnabled():
+            self._waiting_for_tts = False
+            self.status_label.setText("请选择：保留 / 记住了 / 保存退出 (3秒后自动保留)")
+            self.auto_keep_timer = QTimer.singleShot(3000, self._auto_keep)
+
+    def _auto_keep(self):
+        """自动保留当前单词"""
+        if self.btn_keep.isEnabled():
+            self.keep_word()
+
+    def _cancel_auto_keep(self):
+        """取消自动保留定时器"""
+        self._waiting_for_tts = False
+        self.auto_keep_timer = None
 
     def keep_word(self):
         """保留单词"""
         if not self.words_list:
             return
+        self._cancel_auto_keep()
         self.timer.stop()
         self.meaning_label.setText(self.current_meaning)
         self.status_label.setText(f"🚩 '{self.current_word}' 会再次出现")
@@ -213,6 +333,7 @@ class VocabTrainer(QWidget):
         """移除单词"""
         if not self.words_list:
             return
+        self._cancel_auto_keep()
         self.timer.stop()
         self.meaning_label.setText(self.current_meaning)
         self.words_list.remove((self.current_word, self.current_meaning))
@@ -229,11 +350,16 @@ class VocabTrainer(QWidget):
 
     def save_and_quit(self):
         """保存进度并退出"""
+        self._cancel_auto_keep()
         if self.words_list:
             save_words(self.words_list, resource_path('words_tmp.csv'))
         self.timer.stop()
         QMessageBox.information(self, "已保存", f"已保存 {len(self.words_list)} 个单词到 words_tmp.csv")
         self.close()
+
+    def closeEvent(self, event):
+        self._stop_tts()
+        super().closeEvent(event)
 
     def set_buttons_enabled(self, enabled):
         self.btn_keep.setEnabled(enabled)
