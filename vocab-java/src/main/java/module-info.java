@@ -3,4 +3,5 @@ module com.vocabtrainer {
     requires javafx.graphics;
 
     exports com.vocabtrainer;
+    opens com.vocabtrainer;
 }
