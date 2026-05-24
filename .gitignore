@@ -1,0 +1,8 @@
+/vocab-java/target/*
+/vocab-java/.gitignore
+
+/vocab-python/__pycache__/
+/vocab-python/.gitignore
+/vocab-python/dist/
+/vocab-python/build/
+/vocab-python/*.egg-info/
